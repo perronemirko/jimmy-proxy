@@ -481,16 +481,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             full_system_prompt = full_system_prompt[:MAX_SYSTEM_PROMPT]
 
-        jimmy_payload = {
-            "messages": chat_messages,
-            "chatOptions": {
-                "selectedModel": MODELS.get(model, model),
-                "systemPrompt": full_system_prompt,
-                "topK": 8,
-            },
-            "attachment": None,
-        }
+        # jimmy_payload = {
+        #     "messages": chat_messages,
+        #     "chatOptions": {
+        #         "selectedModel": MODELS.get(model, model),
+        #         "systemPrompt": full_system_prompt,
+        #         "topK": 8,
+        #     },
+        #     "attachment": None,
+        # }
+        # 🔧 CLEAN messages (rimuove vuoti e roba strana)
+        clean_messages = []
+        for m in chat_messages:
+            content = m.get("content", "")
+            if not content or not str(content).strip():
+                continue
 
+            clean_messages.append({
+                "role": m.get("role", "user"),
+                "content": str(content)
+            })
+
+        # 🔧 system prompt safe (NO tools, NO roba lunga)
+        safe_system_prompt = (system_prompt or "").strip()
+
+        if len(safe_system_prompt) > 8000:
+            safe_system_prompt = safe_system_prompt[:8000]
+
+        # 🔥 PAYLOAD FINALE FIXATO
+        jimmy_payload = {
+            "messages": clean_messages if clean_messages else [
+                {"role": "user", "content": "Hello"}
+            ],
+            "chatOptions": {
+                "selectedModel": MODELS.get(model, "llama3.1-8B"),
+                "systemPrompt": safe_system_prompt,
+                "topK": 8
+            }
+        }
         # File: translated payload
         logfile("--- TRANSLATED PAYLOAD ---")
         logfile(f"{json.dumps(jimmy_payload, indent=2)}")
