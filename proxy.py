@@ -394,7 +394,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             for t in openai_req.get("tools", [])
             if t.get("function", {}).get("name", "").lower() not in FILTERED_TOOLS
         ]
-        tool_choice = openai_req.get("tool_choice", "auto")
+        tool_choice = openai_req.get("tool_choice", "required")
 
         last_content = extract_text_content(
             messages[-1].get("content", "") if messages else ""
@@ -468,57 +468,54 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 chat_messages.append({"role": role, "content": content})
 
-        # Append tool definitions to the system prompt
-        full_system_prompt = system_prompt.strip()
-        if tools:
-            full_system_prompt += format_tools_for_prompt(tools, tool_choice)
+        # ----- Build final system prompt (base + tools) -----
+        # chatjimmy silently returns empty responses above ~8-10K chars total.
+        # Budget: 2000 for base system, rest for tools.
+        MAX_BASE_SYSTEM = 20000
+        MAX_TOTAL_SYSTEM = 80000
 
-        # ChatJimmy returns empty responses when system prompt exceeds ~30K chars
-        MAX_SYSTEM_PROMPT = 28000
-        if len(full_system_prompt) > MAX_SYSTEM_PROMPT:
+        base_system_prompt = system_prompt.strip()
+        if len(base_system_prompt) > MAX_BASE_SYSTEM:
             logfile(
-                f"WARNING: system prompt is {len(full_system_prompt)} chars, truncating to {MAX_SYSTEM_PROMPT}"
+                f"WARNING: base system prompt is {len(base_system_prompt)} chars, truncating to {MAX_BASE_SYSTEM}"
             )
-            full_system_prompt = full_system_prompt[:MAX_SYSTEM_PROMPT]
+            base_system_prompt = base_system_prompt[:MAX_BASE_SYSTEM]
 
-        # jimmy_payload = {
-        #     "messages": chat_messages,
-        #     "chatOptions": {
-        #         "selectedModel": MODELS.get(model, model),
-        #         "systemPrompt": full_system_prompt,
-        #         "topK": 8,
-        #     },
-        #     "attachment": None,
-        # }
-        # 🔧 CLEAN messages (rimuove vuoti e roba strana)
+        # Always append tool definitions so the model knows how to call them
+        tools_section = format_tools_for_prompt(tools, tool_choice) if tools else ""
+        full_system_prompt = base_system_prompt + tools_section
+
+        if len(full_system_prompt) > MAX_TOTAL_SYSTEM:
+            logfile(
+                f"WARNING: full system prompt is {len(full_system_prompt)} chars, truncating to {MAX_TOTAL_SYSTEM}. "
+                f"Consider reducing the number of tools (currently {len(tools)})."
+            )
+            log(f"WARNING: system prompt too large ({len(full_system_prompt)} chars with {len(tools)} tools), truncating")
+            full_system_prompt = full_system_prompt[:MAX_TOTAL_SYSTEM]
+
+        # Clean messages: drop empty content, keep all valid roles
         clean_messages = []
         for m in chat_messages:
-            content = m.get("content", "")
-            if not content or not str(content).strip():
+            msg_content = m.get("content", "")
+            if not msg_content or not str(msg_content).strip():
                 continue
-
             clean_messages.append({
                 "role": m.get("role", "user"),
-                "content": str(content)
+                "content": str(msg_content),
             })
 
-        # 🔧 system prompt safe (NO tools, NO roba lunga)
-        safe_system_prompt = (system_prompt or "").strip()
+        if not clean_messages:
+            clean_messages = [{"role": "user", "content": "Hello"}]
 
-        if len(safe_system_prompt) > 8000:
-            safe_system_prompt = safe_system_prompt[:8000]
-
-        # 🔥 PAYLOAD FINALE FIXATO
         jimmy_payload = {
-            "messages": clean_messages if clean_messages else [
-                {"role": "user", "content": "Hello"}
-            ],
+            "messages": clean_messages,
             "chatOptions": {
                 "selectedModel": MODELS.get(model, "llama3.1-8B"),
-                "systemPrompt": safe_system_prompt,
-                "topK": 8
-            }
+                "systemPrompt": full_system_prompt,
+                "topK": 8,
+            },
         }
+
         # File: translated payload
         logfile("--- TRANSLATED PAYLOAD ---")
         logfile(f"{json.dumps(jimmy_payload, indent=2)}")
@@ -553,6 +550,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # File: raw upstream response
         logfile("--- RAW UPSTREAM RESPONSE ---")
         logfile(raw_response)
+
+        # Warn on empty or suspiciously short responses
+        if not raw_response.strip():
+            log(f"WARNING: upstream returned empty response (system_prompt={len(full_system_prompt)} chars, tools={len(tools)})")
+        elif len(raw_response.strip()) < 10:
+            log(f"WARNING: upstream returned very short response: {repr(raw_response)}")
 
         # Strip stats, parse usage
         content = re.sub(
