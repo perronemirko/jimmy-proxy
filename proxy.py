@@ -213,11 +213,25 @@ def _extract_call_objects(obj):
 def parse_tool_calls(content, tools=None):
     """
     Parse <tool_call>…</tool_call> blocks from the model's text.
+    Also handles bare JSON tool calls without tags (fallback).
 
     Returns (text_without_tags, list_of_openai_tool_call_dicts).
     """
     pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
     matches = pattern.findall(content)
+
+    # Fallback: detect bare JSON like {"name": "...", "arguments": {...}}
+    # when the model forgets to wrap in <tool_call> tags
+    bare_match = None
+    if not matches:
+        bare_pattern = re.compile(
+            r'(\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}[^{}]*\})',
+            re.DOTALL,
+        )
+        bare_matches = bare_pattern.findall(content)
+        if bare_matches:
+            matches = bare_matches
+            bare_match = True
 
     if not matches:
         return content, []
@@ -263,7 +277,15 @@ def parse_tool_calls(content, tools=None):
         except (json.JSONDecodeError, KeyError, AttributeError):
             continue
 
-    text = pattern.sub("", content).strip()
+    if bare_match:
+        # Remove the matched bare JSON blobs from text
+        bare_pattern = re.compile(
+            r'(\{[^{}]*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*?\}[^{}]*\})',
+            re.DOTALL,
+        )
+        text = bare_pattern.sub("", content).strip()
+    else:
+        text = pattern.sub("", content).strip()
     return text, tool_calls
 
 
@@ -468,30 +490,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 chat_messages.append({"role": role, "content": content})
 
-        # ----- Build final system prompt (base + tools) -----
-        # chatjimmy silently returns empty responses above ~8-10K chars total.
-        # Budget: 2000 for base system, rest for tools.
-        MAX_BASE_SYSTEM = 20000
+        # ----- Build final system prompt (tools first, then base) -----
+        # chatjimmy silently returns empty responses above ~8000 chars.
+        # Strategy: tools are ALWAYS included intact (they must not be truncated),
+        # and the base system prompt is trimmed to fit within the budget.
         MAX_TOTAL_SYSTEM = 80000
 
-        base_system_prompt = system_prompt.strip()
-        if len(base_system_prompt) > MAX_BASE_SYSTEM:
-            logfile(
-                f"WARNING: base system prompt is {len(base_system_prompt)} chars, truncating to {MAX_BASE_SYSTEM}"
-            )
-            base_system_prompt = base_system_prompt[:MAX_BASE_SYSTEM]
-
-        # Always append tool definitions so the model knows how to call them
         tools_section = format_tools_for_prompt(tools, tool_choice) if tools else ""
+        tools_len = len(tools_section)
+
+        base_budget = max(0, MAX_TOTAL_SYSTEM - tools_len)
+        base_system_prompt = system_prompt.strip()
+
+        if len(base_system_prompt) > base_budget:
+            logfile(
+                f"WARNING: base system prompt truncated from {len(base_system_prompt)} to {base_budget} chars "
+                f"(tools use {tools_len} chars)"
+            )
+            base_system_prompt = base_system_prompt[:base_budget]
+
+        # Tools go LAST so they are never cut off by truncation
         full_system_prompt = base_system_prompt + tools_section
 
-        if len(full_system_prompt) > MAX_TOTAL_SYSTEM:
-            logfile(
-                f"WARNING: full system prompt is {len(full_system_prompt)} chars, truncating to {MAX_TOTAL_SYSTEM}. "
-                f"Consider reducing the number of tools (currently {len(tools)})."
-            )
-            log(f"WARNING: system prompt too large ({len(full_system_prompt)} chars with {len(tools)} tools), truncating")
-            full_system_prompt = full_system_prompt[:MAX_TOTAL_SYSTEM]
+        log(f"system_prompt={len(full_system_prompt)} chars (base={len(base_system_prompt)}, tools={tools_len})")
 
         # Clean messages: drop empty content, keep all valid roles
         clean_messages = []
